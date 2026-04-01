@@ -1159,10 +1159,19 @@ func runLabel(
 
 // ── THEME ─────────────────────────────────────────────────────────────
 
+// themeBatchSize is the number of labels per mapping batch in pass 2.
+// Sized so that output (~1 line per label, ~15 tokens each) fits
+// comfortably within 4096 output tokens.
+const themeBatchSize = 200
+
 // runTheme consolidates a fragmented label set into canonical themes.
 // This handles the cold-start case where parallel labeling produces hundreds of
 // unique labels because conversations are labeled without shared vocabulary.
 // The mapping is applied at group time (labels on disk stay pristine).
+//
+// Two passes:
+//  1. Identify 15-25 canonical themes (fixed output, scales with any input size)
+//  2. Map labels → themes in parallel batches (output bounded per batch)
 func runTheme(
 	ctx context.Context,
 	store storage.Store,
@@ -1194,7 +1203,7 @@ func runTheme(
 	}
 	sort.Strings(sorted)
 
-	fp := Fingerprint(append(sorted, Fingerprint(prompts.Theme))...)
+	fp := Fingerprint(append(sorted, Fingerprint(prompts.ThemeIdentify), Fingerprint(prompts.ThemeMap))...)
 
 	// Check cache
 	existing, err := GetThemes(ctx, store)
@@ -1202,39 +1211,110 @@ func runTheme(
 		return existing.Mapping, inference.Usage{}, nil
 	}
 
-	// Build input: one label per line
-	var input strings.Builder
+	// Build label list for pass 1 input
+	var labelList strings.Builder
 	for _, l := range sorted {
-		input.WriteString("- ")
-		input.WriteString(l)
-		input.WriteString("\n")
+		labelList.WriteString("- ")
+		labelList.WriteString(l)
+		labelList.WriteString("\n")
 	}
 
-	resp, usage, err := inference.Converse(ctx, llm, prompts.Theme, input.String(), inference.WithMaxTokens(16384))
+	// ── Pass 1: identify canonical themes (fixed output) ──────────────
+	resp, usage, err := inference.Converse(ctx, llm, prompts.ThemeIdentify, labelList.String(), inference.WithMaxTokens(4096))
 	if err != nil {
-		return nil, usage, fmt.Errorf("theme: %w", err)
+		return nil, usage, fmt.Errorf("theme identify: %w", err)
 	}
 
-	mapping := parseThemeResponse(resp)
+	themes := parseThemeLines(resp)
+	if len(themes) == 0 {
+		return nil, usage, fmt.Errorf("theme identify: no themes found in response")
+	}
 
-	if verbose && len(mapping) > 0 {
-		fmt.Fprintf(os.Stderr, "  Themed %d labels:\n", len(mapping))
+	// ── Pass 2: map labels → themes in parallel batches ───────────────
+	themeList := strings.Join(themes, "\n")
+
+	var mu sync.Mutex
+	mapping := map[string]string{}
+	var totalUsage inference.Usage
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(10)
+
+	for i := 0; i < len(sorted); i += themeBatchSize {
+		end := i + themeBatchSize
+		if end > len(sorted) {
+			end = len(sorted)
+		}
+		batch := sorted[i:end]
+
+		g.Go(func() error {
+			var input strings.Builder
+			input.WriteString("THEMES:\n")
+			input.WriteString(themeList)
+			input.WriteString("\n\nLABELS:\n")
+			for _, l := range batch {
+				input.WriteString("- ")
+				input.WriteString(l)
+				input.WriteString("\n")
+			}
+
+			resp, u, err := inference.Converse(ctx, llm, prompts.ThemeMap, input.String(), inference.WithMaxTokens(4096))
+			mu.Lock()
+			totalUsage = totalUsage.Add(u)
+			mu.Unlock()
+			// Tolerate truncation: partial mappings are fine, unmapped labels
+			// pass through ungrouped. parseThemeMappings handles partial output.
+			if err != nil && !inference.IsTruncated(err) {
+				return fmt.Errorf("theme map batch: %w", err)
+			}
+
+			batchMapping := parseThemeMappings(resp)
+			mu.Lock()
+			for k, v := range batchMapping {
+				mapping[k] = v
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, totalUsage.Add(usage), fmt.Errorf("theme: %w", err)
+	}
+	totalUsage = totalUsage.Add(usage)
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "  %d themes, mapped %d/%d labels\n", len(themes), len(mapping), len(sorted))
 	}
 
 	// Save
-	themes := &LabelMapping{
+	result := &LabelMapping{
 		Fingerprint: fp,
 		Mapping:     mapping,
 	}
-	if err := PutThemes(ctx, store, themes); err != nil {
-		return nil, usage, fmt.Errorf("save themes: %w", err)
+	if err := PutThemes(ctx, store, result); err != nil {
+		return nil, totalUsage, fmt.Errorf("save themes: %w", err)
 	}
 
-	return mapping, usage, nil
+	return mapping, totalUsage, nil
 }
 
-// parseThemeResponse parses "original → canonical" lines from the LLM response.
-func parseThemeResponse(resp string) map[string]string {
+// parseThemeLines extracts "THEME: <name>" lines from the pass 1 response.
+func parseThemeLines(resp string) []string {
+	var themes []string
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "THEME: "); ok {
+			after = strings.TrimSpace(after)
+			if after != "" {
+				themes = append(themes, after)
+			}
+		}
+	}
+	return themes
+}
+
+// parseThemeMappings parses "original → canonical" lines from the pass 2 response.
+func parseThemeMappings(resp string) map[string]string {
 	mapping := map[string]string{}
 	for _, line := range strings.Split(resp, "\n") {
 		line = strings.TrimSpace(line)
