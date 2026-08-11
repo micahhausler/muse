@@ -1026,6 +1026,11 @@ func buildLabelPrompt(existingLabels []string) string {
 // labelBatchSize is how many observations to send per LLM call.
 const labelBatchSize = 10
 
+// labelMaxTokens caps the output of a single label call. One short label per
+// batch entry needs very little, and thinking is disabled on these calls so the
+// whole allowance goes to text.
+const labelMaxTokens = 1024
+
 // buildLabelInput formats a numbered list of observations for batch labeling.
 func buildLabelInput(observations []string) string {
 	var b strings.Builder
@@ -1178,7 +1183,12 @@ func runLabel(
 
 				prompt := buildLabelPrompt(labels.list())
 				input := buildLabelInput(batchTexts)
-				resp, u, err := inference.Converse(ctx, llm, prompt, input, inference.WithMaxTokens(1024))
+				// Labeling is mechanical classification against a vocabulary,
+				// so thinking buys nothing and reasoning tokens are billed
+				// against MaxTokens. Without this the whole 1024 goes to
+				// reasoning and the response truncates before the labels land.
+				resp, u, err := inference.Converse(ctx, llm, prompt, input,
+					inference.WithMaxTokens(labelMaxTokens), inference.WithoutThinking())
 				usage = usage.Add(u)
 				if err != nil {
 					return fmt.Errorf("label batch for %s/%s: %w", key.source, key.conversationID, err)
@@ -1290,7 +1300,12 @@ func runTheme(
 	}
 
 	// ── Pass 1: identify canonical themes (fixed output) ──────────────
-	resp, usage, err := inference.Converse(ctx, llm, prompts.ThemeIdentify, labelList.String(), inference.WithMaxTokens(4096))
+	// Thinking is disabled: the output is a constrained list of 15-25 lines, so
+	// reasoning tokens only compete with the text allocation. Measured against
+	// the real label corpus, disabling produces the same 25 themes for a
+	// quarter of the tokens and removes intermittent truncation.
+	resp, usage, err := inference.Converse(ctx, llm, prompts.ThemeIdentify, labelList.String(),
+		inference.WithMaxTokens(4096), inference.WithoutThinking())
 	if err != nil {
 		return nil, usage, fmt.Errorf("theme identify: %w", err)
 	}
@@ -1330,7 +1345,13 @@ func runTheme(
 					input.WriteString("\n")
 				}
 
-				resp, u, err := inference.Converse(gctx, llm, prompts.ThemeMap, input.String(), inference.WithMaxTokens(4096))
+				// Thinking is disabled here for the same reason as pass 1, and
+				// because truncation on this call is silent: an empty response
+				// yields no mappings, and a round with no progress self-maps
+				// every remaining label into its own theme, quietly destroying
+				// the clustering instead of failing.
+				resp, u, err := inference.Converse(gctx, llm, prompts.ThemeMap, input.String(),
+					inference.WithMaxTokens(4096), inference.WithoutThinking())
 				mu.Lock()
 				totalUsage = totalUsage.Add(u)
 				mu.Unlock()
@@ -1676,7 +1697,13 @@ func runThesis(
 		fmt.Fprintf(&input, "### Cluster %d\n\n%s\n\n", i+1, summary)
 	}
 
-	resp, usage, err := inference.Converse(ctx, llm, prompts.Thesis, input.String(), inference.WithMaxTokens(4096))
+	// Unlike the theme passes, this is genuine synthesis and the output is
+	// large: it must classify every cluster by name, since ValidateThesis
+	// rejects a response that drops one. Declare a thinking budget so reasoning
+	// is allocated on top of the text ceiling rather than consuming it, matching
+	// what compose and ask do for the same character of work.
+	resp, usage, err := inference.Converse(ctx, llm, prompts.Thesis, input.String(),
+		inference.WithMaxTokens(4096), inference.WithThinking(inference.DefaultThinkingBudget))
 	if err != nil {
 		return "", usage, err
 	}

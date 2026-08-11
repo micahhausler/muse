@@ -5,8 +5,17 @@ type ConverseOption func(*ConverseOptions)
 
 // ConverseOptions holds per-call overrides.
 type ConverseOptions struct {
-	MaxTokens      int32 // 0 means use the client default
-	ThinkingBudget int32 // 0 means no extended thinking
+	MaxTokens int32 // 0 means use the client default
+	// ThinkingBudget > 0 requests extended thinking with that budget. Zero
+	// expresses no preference and leaves the model's own default in place,
+	// which on current models means thinking is ON. Use ThinkingDisabled to
+	// turn it off.
+	ThinkingBudget int32
+	// ThinkingDisabled explicitly turns extended thinking off rather than
+	// deferring to the model default. Reasoning tokens are billed against
+	// MaxTokens, so a call with a tight MaxTokens must say so to avoid
+	// spending its whole output budget before emitting any text.
+	ThinkingDisabled bool
 }
 
 // DefaultMaxTokens is the default output token limit when not overridden.
@@ -36,6 +45,14 @@ func WithMaxTokens(n int32) ConverseOption {
 // on top of the text output allocation, matching AI SDK behavior.
 func WithThinking(budgetTokens int32) ConverseOption {
 	return func(o *ConverseOptions) { o.ThinkingBudget = budgetTokens }
+}
+
+// WithoutThinking disables extended thinking for a single call instead of
+// inheriting the model default. Use it for mechanical calls that gain nothing
+// from reasoning, especially alongside a small WithMaxTokens, since providers
+// bill reasoning tokens against the output limit.
+func WithoutThinking() ConverseOption {
+	return func(o *ConverseOptions) { o.ThinkingDisabled = true }
 }
 
 // StreamDelta is a chunk of streamed output from the model.

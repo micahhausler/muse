@@ -344,7 +344,11 @@ func ComputeDiff(ctx context.Context, client inference.Client, store storage.Sto
 		input := fmt.Sprintf("Previous muse:\n%s\n\n---\n\nNew muse:\n%s", previous, current)
 		stream := newStageStream(0, 4096) // no thinking, writing bar against 4k budget
 		var err error
-		d, usage, err = inference.ConverseStream(ctx, client, prompts.Diff, input, stream.callback(), inference.WithMaxTokens(4096))
+		// WithoutThinking is what makes the "no thinking" above true. Leaving it
+		// off only expresses no preference, so current models reason by default
+		// and spend the 4k text budget before the changelog is written.
+		d, usage, err = inference.ConverseStream(ctx, client, prompts.Diff, input, stream.callback(),
+			inference.WithMaxTokens(4096), inference.WithoutThinking())
 		stream.finish()
 		if err != nil {
 			return "", usage, err

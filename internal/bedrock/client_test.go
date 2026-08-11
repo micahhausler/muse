@@ -157,3 +157,73 @@ func TestRetryThrottled_Integration(t *testing.T) {
 		t.Fatalf("batch took %s — expected < 2s at 100 req/s", elapsed.Round(time.Millisecond))
 	}
 }
+
+func TestThinkingFields(t *testing.T) {
+	tests := []struct {
+		name string
+		opts inference.ConverseOptions
+		want string
+	}{
+		{
+			name: "no preference leaves the model default in place",
+			opts: inference.ConverseOptions{MaxTokens: 1024},
+			want: "",
+		},
+		{
+			name: "explicit budget enables adaptive thinking",
+			opts: inference.ConverseOptions{ThinkingBudget: 16000},
+			want: `{"output_config":{"effort":"high"},"thinking":{"type":"adaptive"}}`,
+		},
+		{
+			name: "explicitly disabled turns thinking off",
+			opts: inference.ConverseOptions{MaxTokens: 1024, ThinkingDisabled: true},
+			want: `{"thinking":{"type":"disabled"}}`,
+		},
+		{
+			name: "an explicit budget wins over disabled",
+			opts: inference.ConverseOptions{ThinkingBudget: 16000, ThinkingDisabled: true},
+			want: `{"output_config":{"effort":"high"},"thinking":{"type":"adaptive"}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := thinkingFields(tt.opts)
+			if tt.want == "" {
+				if got != nil {
+					t.Fatalf("thinkingFields = %v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("thinkingFields = nil, want %s", tt.want)
+			}
+			raw, err := got.MarshalSmithyDocument()
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(raw) != tt.want {
+				t.Fatalf("thinkingFields = %s, want %s", raw, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveMaxTokens(t *testing.T) {
+	tests := []struct {
+		name string
+		opts inference.ConverseOptions
+		want int32
+	}{
+		{"default when unset", inference.ConverseOptions{}, inference.DefaultMaxTokens},
+		{"explicit override", inference.ConverseOptions{MaxTokens: 1024}, 1024},
+		{"thinking budget is added on top", inference.ConverseOptions{MaxTokens: 1024, ThinkingBudget: 16000}, 17024},
+		{"disabling thinking does not change the ceiling", inference.ConverseOptions{MaxTokens: 1024, ThinkingDisabled: true}, 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveMaxTokens(tt.opts); got != tt.want {
+				t.Fatalf("resolveMaxTokens = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

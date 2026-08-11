@@ -54,6 +54,46 @@ func lookupPricing(model string) modelPricing {
 	return bestPricing
 }
 
+// resolveMaxTokens returns the output token ceiling for a call. An explicit
+// thinking budget is added on top of the text allocation because Bedrock bills
+// reasoning tokens against MaxTokens.
+func resolveMaxTokens(o inference.ConverseOptions) int32 {
+	maxTokens := int32(inference.DefaultMaxTokens)
+	if o.MaxTokens > 0 {
+		maxTokens = o.MaxTokens
+	}
+	if o.ThinkingBudget > 0 {
+		maxTokens += o.ThinkingBudget
+	}
+	return maxTokens
+}
+
+// thinkingFields builds the thinking configuration sent alongside the request.
+// Returns nil when the caller expressed no preference, which leaves the model
+// default in place. Current models reason by default, so turning it off has to
+// be stated explicitly.
+func thinkingFields(o inference.ConverseOptions) document.Interface {
+	switch {
+	case o.ThinkingBudget > 0:
+		return document.NewLazyDocument(map[string]any{
+			"thinking": map[string]any{
+				"type": "adaptive",
+			},
+			"output_config": map[string]any{
+				"effort": effortForBudget(o.ThinkingBudget),
+			},
+		})
+	case o.ThinkingDisabled:
+		return document.NewLazyDocument(map[string]any{
+			"thinking": map[string]any{
+				"type": "disabled",
+			},
+		})
+	default:
+		return nil
+	}
+}
+
 // effortForBudget maps a thinking token budget to an Anthropic effort level.
 // This parallels the OpenAI provider's reasoningEffortForBudget mapping.
 func effortForBudget(budget int32) string {
@@ -182,31 +222,17 @@ func (c *Client) ConverseMessagesStream(ctx context.Context, system string, mess
 	}
 
 	o := inference.Apply(opts)
-	maxTokens := int32(inference.DefaultMaxTokens)
-	if o.MaxTokens > 0 {
-		maxTokens = o.MaxTokens
-	}
-	if o.ThinkingBudget > 0 {
-		maxTokens += o.ThinkingBudget
-	}
 
 	input := &bedrockruntime.ConverseStreamInput{
 		ModelId:  &c.model,
 		System:   systemBlocks(system),
 		Messages: toBedrockMessages(messages),
 		InferenceConfig: &types.InferenceConfiguration{
-			MaxTokens: aws.Int32(maxTokens),
+			MaxTokens: aws.Int32(resolveMaxTokens(o)),
 		},
 	}
-	if o.ThinkingBudget > 0 {
-		input.AdditionalModelRequestFields = document.NewLazyDocument(map[string]any{
-			"thinking": map[string]any{
-				"type": "adaptive",
-			},
-			"output_config": map[string]any{
-				"effort": effortForBudget(o.ThinkingBudget),
-			},
-		})
+	if fields := thinkingFields(o); fields != nil {
+		input.AdditionalModelRequestFields = fields
 	}
 
 	var result *inference.Response
@@ -253,30 +279,16 @@ func (c *Client) converseRaw(ctx context.Context, system string, messages []type
 }
 
 func (c *Client) converseRawOnce(ctx context.Context, system string, messages []types.Message, toolConfig *types.ToolConfiguration, opts inference.ConverseOptions) (string, Usage, types.StopReason, error) {
-	maxTokens := int32(inference.DefaultMaxTokens)
-	if opts.MaxTokens > 0 {
-		maxTokens = opts.MaxTokens
-	}
-	if opts.ThinkingBudget > 0 {
-		maxTokens += opts.ThinkingBudget
-	}
 	input := &bedrockruntime.ConverseInput{
 		ModelId:  &c.model,
 		System:   systemBlocks(system),
 		Messages: messages,
 		InferenceConfig: &types.InferenceConfiguration{
-			MaxTokens: aws.Int32(maxTokens),
+			MaxTokens: aws.Int32(resolveMaxTokens(opts)),
 		},
 	}
-	if opts.ThinkingBudget > 0 {
-		input.AdditionalModelRequestFields = document.NewLazyDocument(map[string]any{
-			"thinking": map[string]any{
-				"type": "adaptive",
-			},
-			"output_config": map[string]any{
-				"effort": effortForBudget(opts.ThinkingBudget),
-			},
-		})
+	if fields := thinkingFields(opts); fields != nil {
+		input.AdditionalModelRequestFields = fields
 	}
 	if toolConfig != nil {
 		input.ToolConfig = toolConfig

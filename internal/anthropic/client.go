@@ -183,6 +183,9 @@ func (c *Client) buildParams(system string, messages []inference.Message, opts i
 
 	if opts.ThinkingBudget > 0 {
 		params.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(opts.ThinkingBudget))
+	} else if opts.ThinkingDisabled {
+		disabled := anthropic.NewThinkingConfigDisabledParam()
+		params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &disabled}
 	}
 
 	return params
